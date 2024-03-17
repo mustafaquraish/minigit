@@ -1,0 +1,10 @@
+# Ignore everything
+*
+
+!.gitignore
+
+# Allow all files in src/
+!/src/
+!/src/*.oc
+!/test.sh
+!/README.md
