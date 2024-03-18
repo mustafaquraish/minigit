@@ -1,0 +1,345 @@
+//* Everything here is related to parsing and unpacking the PACK
+//* file from the git server, and then writing the files to disk.
+//* It also resolves the deltas.
+
+import std::fs
+import std::panic
+import std::hash::sha1::{ SHA1Hash }
+import std::sv::{ SV }
+import std::zlib
+import std::buffer::{ Buffer }
+import std::bufferio::{ BufferIO }
+import std::libc::{ memcpy }
+import std::vector::{ Vector }
+// import std::set::{ Set }
+import std::map::{ Map }
+// import std::sort::{ sort }
+// import std::traits::hash::{ hash_bytes }
+// import std::time
+
+import @core::{
+    StringHash,
+    ObjectType,
+}
+
+import @utils::{
+    write_object_from_body,
+}
+
+def extract_pkt_lines(data: &Buffer): &Vector<SV> {
+    let lines = Vector<SV>::new()
+    let sv = data.sv()
+
+    while not sv.is_empty() {
+        if sv.starts_with_str("PACK") {
+            lines.push(sv)
+            break
+        }
+
+        let size_sv = sv.chop_left(4)
+        let sz_buf: [char; 5]
+        memcpy(sz_buf, size_sv.data, 4)
+
+        let size = std::libc::strtol(sz_buf, null, 16)
+        let usize = i32::max(size - 4, 0) as u32
+        let line = sv.chop_left(usize)
+        line.trim()
+        lines.push(line)
+    }
+
+    return lines
+}
+
+struct PackLineGenerator {
+    data: Buffer
+}
+
+def PackLineGenerator::make(): PackLineGenerator {
+    return PackLineGenerator(Buffer::make())
+}
+
+def PackLineGenerator::free(&this) {
+    .data.free()
+}
+
+def PackLineGenerator::add_line_str(&this, line: str) {
+    let size = line.len()
+    if size != 0 {
+        size += 4
+    }
+    .data.putsf(`{size:04x}`)
+    .data.puts(line)
+}
+
+def PackLineGenerator::add_line_strf(&this, line: str) {
+    .add_line_str(line)
+    line.free()
+}
+
+def PackLineGenerator::add_null_byte(&this) {
+    .data.putc('\0')
+}
+
+def PackLineGenerator::add_newline(&this) {
+    .data.putc('\n')
+}
+
+def read_size(io: &BufferIO): u32 {
+    let size = 0
+    let off = 0
+
+    while true {
+        let byte: u8 = io.read_u8()
+        let n = (byte & 0x7f) as u32 << off
+        size = n | size
+        off += 7
+        if byte >> 7 == 0 break
+    }
+    return size
+}
+
+def parse_delta_offset_size(io: &BufferIO, flags: u8, start_bit: i8, end_bit: i8): u32 {
+    let num = 0
+    let off = 0
+    for let i = start_bit; i <= end_bit; i++ {
+        let bit = flags >> i as u8 & 0x1
+        if bit == 1 {
+            let byte = io.read_u8() as u32
+            num = num | (byte << off)
+        }
+        off += 8
+    }
+    return num
+}
+
+def dump_bits(byte: u8) {
+    print(`{byte} = 0x{byte:02x} = `)
+    for let i = 7i32; i >= 0; i-- {
+        let bit = byte >> i as u8 & 1
+        print(`{bit}`)
+    }
+    println("")
+}
+
+enum InstructionType {
+    Copy
+    Insert
+}
+
+struct Instruction {
+    type: InstructionType
+    offset: u32
+    size: u32
+    data: SV
+}
+
+def Instruction::make_copy(offset: u32, size: u32): Instruction {
+    let inst: Instruction
+    inst.type = InstructionType::Copy
+    inst.offset = offset
+    inst.size = size
+    return inst
+}
+
+def Instruction::make_insert(data: SV): Instruction {
+    let inst: Instruction
+    inst.type = InstructionType::Insert
+    inst.data = data
+    return inst
+}
+
+struct Delta {
+    ref: StringHash
+    base_size: u32
+    result_size: u32
+    instructions: &Vector<Instruction>
+}
+
+def Delta::free(&this) {
+    .instructions.free()
+}
+
+
+def parse_delta(ref: &StringHash, data: Buffer): Delta {
+    let io = BufferIO::make(&data)
+    let base_size = read_size(&io)
+    let result_size = read_size(&io)
+
+    // println(f"   delta: base_size={base_size} result_size={result_size}")
+    let instructions = Vector<Instruction>::new()
+
+    while not io.is_empty() {
+        let cur = io.read_u8()
+
+        if cur & 0x80 != 0 {
+            let flags = cur & 0x7f
+            let offset = parse_delta_offset_size(&io, flags, 0, 3)
+            let size = parse_delta_offset_size(&io, flags, 4, 6)
+            if size == 0 then size = 0x10000
+
+            // println(f"     delta copy: offset={offset} size={size}")
+            instructions.push(Instruction::make_copy(offset, size))
+
+        } else {
+            let size = (cur & 0x7f) as u32
+            let data = io.read_bytes_sv(size)
+            // println(f"     delta insert: size={size}")
+
+            instructions.push(Instruction::make_insert(data))
+        }
+    }
+
+    // println(f"   delta: instructions={instructions.size}")
+    return Delta(*ref, base_size, result_size, instructions)
+}
+
+struct RawObject {
+    type: ObjectType
+    buf: Buffer
+}
+
+def unpack_all_objects(data: &Buffer) {
+    let lines = extract_pkt_lines(data)
+    defer lines.free()
+
+    assert lines.size == 2, "Invalid response from server"
+    assert lines.at(0).eq_str("NAK"), "Server does not support smart protocol"
+
+    let pack_line = lines.at(1)
+    let buf = Buffer::from_sv(pack_line)
+    let io = BufferIO::make(&buf)
+
+    let header = io.read_bytes_sv(4)
+    assert header.eq_str("PACK"), "Invalid pack header"
+
+    let version = io.read_u32()
+    let num_objects = io.read_u32()
+
+    let deltas = Vector<Delta>::new()
+    defer {
+        for delta : deltas.iter() {
+            delta.free()
+        }
+        deltas.free()
+    }
+
+    let store = Map<StringHash, RawObject>::new()
+    defer {
+        for obj : store.iter_values() {
+            obj.buf.free()
+        }
+        store.free()
+    }
+
+    println(f"[+] Unpacking objects: {num_objects}")
+
+    fs::create_directory(".git/objects")
+    fs::create_directory(".git/objects/pack")
+
+    for let i = 0; i < num_objects; i++ {
+        let byte = io.read_u8()
+        let type = match byte >> 4 & 0b0111 {
+            1 => "commit"
+            2 => "tree"
+            3 => "blob"
+            4 => "tag"
+            5 => "<reserved>"
+            6 => "ofs-delta"
+            7 => "ref-delta"
+            else => panic(`[-] Invalid object type: {byte >> 5}`)
+        }
+
+        let off = 4
+        let size = (byte & 0x0f) as u32
+        while byte >> 7 != 0 {
+            byte = io.read_u8()
+            let n = (byte & 0x7f) as u32 << off
+            size = n | size
+            off += 7
+        }
+
+        let ref: StringHash
+        match type {
+            "ofs-delta" | "ref-delta" => {
+                let sha: SHA1Hash
+                io.read_bytes(sha.data, 20)
+                ref = StringHash::from_hash_bytes(&sha)
+            }
+            else => {}
+        }
+
+        let bytes_consumed: u32
+        let decompressed = zlib::decompress_bytes(
+            buf.data + io.index,
+            buf.size - io.index,
+            &bytes_consumed
+        )
+        io.index += bytes_consumed
+        // println(f"   dec: consumed={bytes_consumed} len(decompressed)={decompressed.size}")
+
+        match type {
+            "ofs-delta" | "ref-delta" => {
+                let delta = parse_delta(&ref, decompressed)
+                deltas.push(delta)
+            }
+            else => {
+                let obj_type = match type {
+                    "commit" => ObjectType::Commit
+                    "tree" => ObjectType::Tree
+                    "blob" => ObjectType::Blob
+                    "tag" => ObjectType::Tag
+                    else => panic(`[-] Unknown object type: {type}`)
+                }
+                let hash = write_object_from_body(obj_type, decompressed)
+                store.insert(hash, RawObject(obj_type, decompressed))
+            }
+        }
+    }
+
+    println(f"[+] Applying deltas: {deltas.size}")
+
+    while deltas.size > 0 {
+        let remaining = Vector<Delta>::new()
+        for let i = 0; i < deltas.size; i++ {
+            let delta = &deltas.data[i]
+
+            let it = store.get_item(delta.ref)
+            if not it? {
+                remaining.push(*delta)
+                continue
+            }
+
+            // println(f"[+] Applying delta: {delta.ref.data}")
+            let base = it.value
+            let base_data = base.buf
+
+            let body = Buffer::make()
+            for inst : delta.instructions.iter() {
+                match inst.type {
+                    Copy => {
+                        // println(f"    copy: {inst.offset}, {inst.size}")
+                        body.put_bytes(base_data.data + inst.offset, inst.size)
+                    }
+                    Insert => {
+                        // println(f"    insert: {inst.data.len}")
+                        body.put_bytes(inst.data.data as &u8, inst.data.len)
+                    }
+                }
+            }
+            let new_obj = RawObject(base.type, body)
+            let hash = write_object_from_body(base.type, body)
+            store.insert(hash, new_obj)
+
+            delta.free()
+        }
+
+        if remaining.size == deltas.size {
+            panic(`[-] Could not apply any deltas, remaining: {remaining.size}`)
+        }
+
+        deltas.free()
+        deltas = remaining
+    }
+
+    println(f"[+] Store: {store.size}")
+}

@@ -1,4 +1,5 @@
-//* Bindings for libcurl
+//* Bindings for libcurl used to talk to the git server
+
 @compiler c_include "curl/curl.h"
 @compiler c_flag "-lcurl"
 
@@ -18,6 +19,8 @@ enum Option {
     PostFields = extern("CURLOPT_POSTFIELDS")
     PostFieldSize = extern("CURLOPT_POSTFIELDSIZE")
     FollowLocation = extern("CURLOPT_FOLLOWLOCATION")
+    Post = extern("CURLOPT_POST")
+    Verbose = extern("CURLOPT_VERBOSE")
 }
 
 [extern "CURL"] struct Context
@@ -81,15 +84,16 @@ def http_request_auth(
     let headers: &SList = null
     let out = Buffer::make()
     curl.easy_setopt(URL, url)
-    curl.easy_setopt(Username, username)
-    curl.easy_setopt(Password, password)
+    if username? then curl.easy_setopt(Username, username)
+    if password? then curl.easy_setopt(Password, password)
     curl.easy_setopt(WriteFunction, impl::write_callback)
     curl.easy_setopt(WriteData, &out)
     curl.easy_setopt(FollowLocation, 1)
 
+    let verbose = std::libc::getenv("CURL_VERBOSE")
+    if verbose? then curl.easy_setopt(Verbose, 1)
+
     if data? {
-        headers = headers.append("Content-Type: application/x-www-form-urlencoded")
-        curl.easy_setopt(HTTPHeader, headers)
         curl.easy_setopt(PostFields, data.str())
         curl.easy_setopt(PostFieldSize, data.size)
     }
@@ -104,4 +108,8 @@ def http_request_auth(
 
     global_cleanup()
     return out
+}
+
+def http_request(url: str, data: &Buffer = null): Buffer {
+    return http_request_auth(url, null, null, data)
 }

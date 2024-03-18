@@ -1,18 +1,46 @@
 import std::fs
 import std::panic
-import std::hash::sha1::{ SHA1Hash }
+// import std::hash::sha1::{ SHA1Hash }
 import std::sv::{ SV }
-import std::zlib
-import std::buffer::{ Buffer }
-import std::bufferio::{ BufferIO }
-import std::libc::{ memcpy, memcmp }
+// import std::zlib
+// import std::buffer::{ Buffer }
+// import std::bufferio::{ BufferIO }
+import std::libc::{ memcpy }
 import std::vector::{ Vector }
-import std::set::{ Set }
-import std::map::{ Map }
-import std::sort::{ sort }
-import std::time
+// import std::set::{ Set }
+// import std::map::{ Map }
+// import std::sort::{ sort }
+// import std::traits::hash::{ hash_bytes }
+// import std::time
 
 import @curl
+import @core::{
+    ObjectType,
+    Object,
+    StringHash,
+    Index,
+    IndexEntry
+}
+import @utils::{
+    repo_base_path,
+    try_expand_hash,
+    get_object_from_hash_str,
+    create_blob_object_from_file,
+    create_tree_object_from_dir,
+    write_object,
+    create_commit_object,
+    get_index,
+    get_repository_status_unstaged,
+    object_exists,
+    restore_working_directory_from_tree,
+    realpath
+}
+
+import @pack::{
+    PackLineGenerator,
+    extract_pkt_lines,
+    unpack_all_objects,
+}
 
 def shift_args(argc: &i32, argv: &&str): str {
     let arg = (*argv)[0]
@@ -21,513 +49,6 @@ def shift_args(argc: &i32, argv: &&str): str {
     return arg
 }
 
-def copy_sv(sv: SV): str {
-    let mem = std::new<char>(sv.len + 1)
-    memcpy(mem, sv.data, sv.len)
-    mem[sv.len] = '\0'
-    return mem
-}
-
-struct StringHash {
-    data: [char; 41]
-}
-
-def StringHash::eq(&this, other: &StringHash): bool {
-    return memcmp(this.data, other.data, 40) == 0
-}
-
-def StringHash::from_hash_bytes(hash_bytes: &SHA1Hash): StringHash {
-    let sh: StringHash
-    for let i = 0; i < 20; i++ {
-        let byte = hash_bytes.data[i]
-        sh.data[i * 2 + 0] = "0123456789abcdef"[byte >> 4]
-        sh.data[i * 2 + 1] = "0123456789abcdef"[byte & 0xf]
-    }
-    sh.data[40] = '\0'
-    return sh
-}
-
-def StringHash::to_hash_bytes(&this): SHA1Hash {
-    let hash_bytes: SHA1Hash
-    for let i = 0; i < 20; i++ {
-        let hi = .data[i * 2 + 0].get_hex_digit()
-        let lo = .data[i * 2 + 1].get_hex_digit()
-        hash_bytes.data[i] = (hi << 4) | lo
-    }
-    return hash_bytes
-}
-
-def StringHash::from_string(s: str): StringHash {
-    let sh: StringHash
-    memcpy(sh.data, s, 40)
-    sh.data[40] = '\0'
-    return sh
-}
-
-struct IndexEntry {
-    ctime_s, ctime_n: u32
-    mtime_s, mtime_n: u32
-    dev, ino: u32
-    modif: u32
-    uid, gid: u32
-    size: u32
-    hash: StringHash
-    flags: u16
-    path: str
-}
-
-def IndexEntry::compare(this, other: IndexEntry): i8 => .path.compare(other.path)
-def IndexEntry::free(&this) => std::free(.path)
-
-struct Index {
-    version: u32
-    entries: &Map<str, IndexEntry>
-}
-
-def Index::free(&this) {
-    for it : .entries.iter() {
-        it.value.free()
-    }
-    .entries.free()
-}
-
-def Index::sorted_entries(&this): &Vector<IndexEntry> {
-    let entries = Vector<IndexEntry>::new()
-    for it : .entries.iter() {
-        entries.push(it.value)
-    }
-    sort<IndexEntry>(entries.data, entries.size)
-    return entries
-}
-
-enum ObjectType {
-    Blob
-    Commit
-    Tree
-}
-
-def ObjectType::str(this): str => match this {
-    Blob => "blob"
-    Commit => "commit"
-    Tree => "tree"
-}
-
-struct TreeEntry {
-    name: str
-    mode: u32
-    hash: StringHash
-}
-
-def TreeEntry::compare(this, other: TreeEntry): i8 => .name.compare(other.name)
-
-struct Commit {
-    tree: StringHash
-    parents: &Vector<StringHash>
-
-    author: str
-    author_time: u64
-    author_tz: str
-
-    committer: str
-    commit_time: u64
-    commit_tz: str
-
-    message: str
-}
-
-def Commit::free(&this) {
-    .parents.free()
-    .author.free()
-    .author_tz.free()
-    .committer.free()
-    .commit_tz.free()
-    .message.free()
-    std::free(this)
-}
-
-union ObjectData {
-    blob: Buffer
-    tree: &Vector<TreeEntry>
-    commit: &Commit
-}
-
-struct Object {
-    type: ObjectType
-    u: ObjectData
-}
-
-def Object::free(this) {
-    match .type {
-        Blob => .u.blob.free()
-        Tree => {
-            for entry : .u.tree.iter() {
-                entry.name.free()
-            }
-            .u.tree.free()
-        }
-        Commit => .u.commit.free()
-    }
-}
-
-def try_expand_hash(hash: str): StringHash {
-    let sv = SV::from_str(hash)
-    let prefix = sv.chop_left(2)
-
-    if sv.len < 1 {
-        panic(`[-] Please provide at least 3 characters of the hash`)
-    }
-
-    let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
-
-    if not fs::directory_exists(dir_path) {
-        panic(`[-] No objects found for hash: {hash}`)
-    }
-
-    let name: str = null
-    for entry : fs::iterate_directory(dir_path) {
-        if entry.name.starts_with(sv.data) {
-            // FIXME: Does this check make sense? Does it just waste time if we don't expect it to be the case?
-            if name? {
-                panic(`[-] Ambiguous hash: {hash}, could be either {prefix}{name} or {prefix}{entry.name}`)
-            }
-            name = entry.name
-        }
-    }
-
-    if not name? {
-        panic(`[-] No objects found for hash: {hash}`)
-    }
-
-    let sh: StringHash
-    memcpy(sh.data, prefix.data, 2)
-    memcpy(sh.data + 2, name, 38)
-    sh.data[40] = '\0'
-    return sh
-}
-
-def get_index(path: str): Index {
-    if not fs::file_exists(path) {
-        panic(`[-] No index file found at {path}`)
-    }
-
-    let contents = fs::read_file(path)
-    let io = BufferIO::make(&contents)
-
-    let header = io.read_u32()
-    if header != 0x44495243 {  // "DIRC"
-        panic("[-] Invalid index file header")
-    }
-
-    let data = contents.data
-    let version = io.read_u32()
-    let num_entries = io.read_u32()
-    let entries = Map<str, IndexEntry>::new(capacity: num_entries)
-
-    for let i = 0; i < num_entries; i++ {
-        let entry: IndexEntry
-        entry.ctime_s = io.read_u32()       // 0-4
-        entry.ctime_n = io.read_u32()       // 4-8
-        entry.mtime_s = io.read_u32()       // 8-12
-        entry.mtime_n = io.read_u32()       // 12-16
-        entry.dev = io.read_u32()           // 16-20
-        entry.ino = io.read_u32()           // 20-24
-        entry.modif = io.read_u32()         // 24-28
-        entry.uid = io.read_u32()           // 28-32
-        entry.gid = io.read_u32()           // 32-36
-        entry.size = io.read_u32()          // 36-40
-
-        let hash_bytes: SHA1Hash
-        io.read_bytes(hash_bytes.data, 20)  // 40-60
-        entry.hash = StringHash::from_hash_bytes(&hash_bytes)
-
-        entry.flags = io.read_u16()         // 60-62
-
-        let buf = Buffer::make()
-        while true {
-            let c = io.read_i8()
-            if c == 0 then break
-            buf.putc(c as char)
-        }
-        entry.path = buf.str()
-
-        let padding = 7 - ((62 + buf.size) % 8)
-        if padding > 0 then io.read_bytes(null, padding)
-
-        entries.insert(entry.path, entry)
-    }
-
-    return Index(version, entries)
-}
-
-def write_index(index: &Index, path: str = ".git/index") {
-    let buf = Buffer::make()
-    defer buf.free()
-    let io = BufferIO::make(&buf)
-
-    io.write_u32(0x44495243)  // "DIRC"
-    io.write_u32(index.version)
-    io.write_u32(index.entries.size)
-
-    let entries = index.sorted_entries()
-    defer entries.free()
-
-    for entry : entries.iter() {
-        io.write_u32(entry.ctime_s)
-        io.write_u32(entry.ctime_n)
-        io.write_u32(entry.mtime_s)
-        io.write_u32(entry.mtime_n)
-        io.write_u32(entry.dev)
-        io.write_u32(entry.ino)
-        io.write_u32(entry.modif)
-        io.write_u32(entry.uid)
-        io.write_u32(entry.gid)
-        io.write_u32(entry.size)
-
-        let hash_bytes = entry.hash.to_hash_bytes()
-        io.write_bytes(hash_bytes.data, 20)
-
-        io.write_u16(entry.flags)
-
-        let path_len = entry.path.len()
-        io.write_bytes(entry.path, path_len)
-        io.write_u8(0)
-
-        let padding = 7 - ((62 + path_len) % 8)
-        for let i = 0; i < padding; i++ {
-            io.write_u8(0)
-        }
-    }
-
-    let digest = SHA1Hash::from(buf)
-
-    let file = fs::File::open(path, "w")
-    file.write(buf.data, buf.size)
-    file.write(digest.data, 20)
-    file.close()
-}
-
-
-def object_exists(hash_str: &StringHash): bool {
-    let hash_sv = SV(hash_str.data, 40)
-    let prefix = hash_sv.chop_left(2)
-
-    let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
-
-    if not fs::directory_exists(dir_path) {
-        return false
-    }
-
-    let file_path = `{dir_path}/{hash_sv}`
-    defer std::free(file_path)
-
-    return fs::file_exists(file_path)
-}
-
-def get_object(hash_str: &StringHash): Object {
-    let hash_sv = SV(hash_str.data, 40)
-    let prefix = hash_sv.chop_left(2)
-
-    let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
-
-    if not fs::directory_exists(dir_path) {
-        panic(`[-] Object {hash_str.data:s} not found (missing directory {dir_path})`)
-    }
-
-    let file_path = `{dir_path}/{hash_sv}`
-    defer std::free(file_path)
-
-    if not fs::file_exists(file_path) {
-        panic(`[-] Object {hash_str.data:s} not found (missing file {file_path})`)
-    }
-
-    let contents = fs::read_file(file_path)
-    defer contents.free()
-
-    let decompressed = zlib::decompress(contents)
-    defer decompressed.free()
-
-    let sv = decompressed.sv()
-    let kind = sv.chop_by_delim(' ')
-    let size = sv.chop_u32()
-    sv.chop_left() // skip null byte
-
-
-    let obj: Object
-
-    if kind.eq_str("blob") {
-        obj.type = ObjectType::Blob
-        obj.u.blob = Buffer::make()
-        obj.u.blob.putsv(sv)
-
-    } else if kind.eq_str("tree") {
-        obj.type = ObjectType::Tree
-
-        let entries = Vector<TreeEntry>::new()
-        while not sv.is_empty() {
-            let mode = sv.chop_by_delim(' ')
-            let name = sv.chop_by_delim('\0')
-            let hash_sv = sv.chop_left(20)
-
-            let hash_bytes: SHA1Hash
-            memcpy(hash_bytes.data, hash_sv.data, 20)
-
-            let entry: TreeEntry
-            entry.mode = std::libc::strtoul(mode.data, null, 8) as u32
-            entry.name = copy_sv(name)
-            entry.hash = StringHash::from_hash_bytes(&hash_bytes)
-
-            entries.push(entry)
-        }
-        obj.u.tree = entries
-
-    } else if kind.eq_str("commit") {
-        obj.type = ObjectType::Commit
-
-        let commit = std::new<Commit>()
-        commit.parents = Vector<StringHash>::new()
-        while not sv.is_empty() {
-            let line = sv.chop_line()
-            if line.is_empty() break
-
-            let key = line.chop_by_delim(' ')
-
-            if key.eq_str("tree") {
-                if line.len != 40 then panic(f"[-] Invalid tree hash: {line}")
-                memcpy(commit.tree.data, line.data, 40)
-
-            } else if key.eq_str("parent") {
-                let parent: StringHash
-                memcpy(parent.data, line.data, 40)
-                commit.parents.push(parent)
-
-            } else if key.eq_str("author") {
-                let author_end = line.find_str("> ")
-                if author_end < 0 then panic(f"[-] Invalid author line: {line}")
-                commit.author = copy_sv(line.chop_left(author_end as u32 + 1))
-                line.chop_left() // skip space
-
-                commit.author_time = line.chop_u64()
-                commit.author_tz = copy_sv(line)
-
-            } else if key.eq_str("committer") {
-                let committer_end = line.find_str("> ")
-                if committer_end < 0 then panic(f"[-] Invalid committer line: {line}")
-                commit.committer = copy_sv(line.chop_left(committer_end as u32 + 1))
-                line.chop_left() // skip space
-
-                commit.commit_time = line.chop_u64()
-                commit.commit_tz = copy_sv(line)
-
-            } else {
-                panic(f"[-] Unknown key: {key}")
-            }
-        }
-
-        if sv.ends_with_str("\n") {
-            sv.chop_right()
-        }
-        commit.message = copy_sv(sv)
-        obj.u.commit = commit
-
-    } else {
-        panic(f"[-] Unknown object type: {kind.data}")
-    }
-
-
-    return obj
-}
-
-def get_object_from_hash_str(hash_str: &StringHash): Object => get_object(hash_str)
-
-def get_object_from_hash(hash: &SHA1Hash): Object {
-    let hash_str = StringHash::from_hash_bytes(hash)
-    return get_object(&hash_str)
-}
-
-def create_blob_object_from_file(filename: str): Object {
-    if not fs::file_exists(filename) {
-        panic(`[-] File '{filename}' not found`)
-    }
-
-    let contents = fs::read_file(filename)
-
-    let obj: Object
-    obj.type = ObjectType::Blob
-    obj.u.blob = contents
-    return obj
-}
-
-def serialize_object(obj: &Object): Buffer {
-    let buf = Buffer::make()
-    defer buf.free()
-
-    match obj.type {
-        Blob => buf.putb(&obj.u.blob)
-        Tree => {
-            for entry : obj.u.tree.iter() {
-                buf.putsf(`{entry.mode} {entry.name}`)
-                buf.putc('\0')
-                let hash_bytes = entry.hash.to_hash_bytes()
-                buf.put_bytes(hash_bytes.data, 20)
-            }
-        }
-        Commit => {
-            let commit = obj.u.commit
-            buf.putsf(`tree {commit.tree.data}\n`)
-            for parent : commit.parents.iter() {
-                buf.putsf(`parent {parent.data}\n`)
-            }
-            buf.putsf(`author {commit.author} {commit.author_time} {commit.author_tz}\n`)
-            buf.putsf(`committer {commit.committer} {commit.commit_time} {commit.commit_tz}\n`)
-            buf.putc('\n')
-            buf.putsf(`{commit.message}\n`)
-        }
-    }
-
-    let obj_data = Buffer::make()
-    obj_data.putsf(`{obj.type.str()} {buf.size}`)
-    obj_data.putc('\0')
-    obj_data.putb(&buf)
-    return obj_data
-}
-
-def get_object_hash_only(obj: &Object): StringHash {
-    let data = serialize_object(obj)
-    defer data.free()
-
-    let hash = SHA1Hash::from(data)
-    let hash_str = StringHash::from_hash_bytes(&hash)
-    return hash_str
-}
-
-def write_object(obj: &Object): StringHash {
-    let data = serialize_object(obj)
-    defer data.free()
-
-    let hash = SHA1Hash::from(data)
-    let hash_str = StringHash::from_hash_bytes(&hash)
-    let hash_sv = SV(hash_str.data, 40)
-
-    let prefix = hash_sv.chop_left(2)
-
-    let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
-
-    fs::create_directory(dir_path, exists_ok: true)
-
-    let file_path = `{dir_path}/{hash_sv}`
-    defer std::free(file_path)
-
-    let compressed = zlib::compress(data)
-    defer compressed.free()
-
-    fs::write_file(file_path, compressed)
-
-    return hash_str
-}
 
 /// Git Subcommands
 
@@ -576,6 +97,7 @@ def git_cat_object(obj: &Object, tree_name_only: bool = false) {
                 }
             }
         }
+        else => panic(`[-] Unknown object type: {obj.type}`)
     }
 }
 
@@ -639,43 +161,6 @@ def git_hash_object(program_name:str, argc: i32, argv: &str) {
     }
 }
 
-def create_tree_object_from_dir(dir_path: str, dry_run: bool = true): Object {
-    let entries = Vector<TreeEntry>::new()
-    defer entries.free()
-
-    for entry : fs::iterate_directory(dir_path) {
-        if entry.name.eq(".git") then continue
-
-        let new_path = `{dir_path}/{entry.name}`
-        defer std::free(new_path)
-
-        let obj = match entry.type {
-            Directory => create_tree_object_from_dir(new_path)
-            File => create_blob_object_from_file(new_path)
-            else => panic(`[-] Unknown file type: {entry.type}`)
-        }
-        let mode = match entry.type {
-            Directory => 16384,  // 040000
-            File => 33188,       // 0100644
-            else => panic(`[-] Unknown file type: {entry.type}`)
-        }
-        let hash = write_object(&obj)
-
-        entries.push(TreeEntry(
-            name: entry.name,
-            mode: mode,
-            hash: hash
-        ))
-    }
-
-    sort<TreeEntry>(entries.data, entries.size)
-
-    let obj: Object
-    obj.type = ObjectType::Tree
-    obj.u.tree = entries
-    return obj
-}
-
 def git_write_tree(program_name: str, argc: i32, argv: &str) {
     let dir = "."
     if argc > 0 then dir = shift_args(&argc, &argv)
@@ -687,39 +172,6 @@ def git_write_tree(program_name: str, argc: i32, argv: &str) {
 
     let hash = write_object(&obj)
     println(`{hash.data:s}`)
-}
-
-def create_commit_object(tree_hash: &StringHash, parent_hashes: &Vector<StringHash>, message: str): Object {
-    // FIXME: Need to get the actual author and committer from the environment
-    let user = "Unknown User <unknown@example.com>"
-    let timezone = Buffer::make(capacity: 6)
-    defer timezone.free()
-
-    let t = time::time(null)
-    let timeinfo = time::localtime(&t)
-    timezone.size += time::strftime(timezone.data as str, 6, "%z", timeinfo)
-
-    let parent_hashes_copy = Vector<StringHash>::new()
-    for parent : parent_hashes.iter() {
-        parent_hashes_copy.push(parent)
-    }
-
-    let obj: Object
-    obj.type = ObjectType::Commit
-
-    obj.u.commit = std::new<Commit>()
-    *obj.u.commit = Commit(
-        tree: *tree_hash,
-        parents: parent_hashes_copy,
-        author: user.copy(),
-        author_time: t as u64,
-        author_tz: timezone.new_str(),
-        committer: user.copy(),
-        commit_time: t as u64,
-        commit_tz: timezone.new_str(),
-        message: message.copy(),
-    )
-    return obj
 }
 
 def git_commit_tree(program_name: str, argc: i32, argv: &str) {
@@ -787,205 +239,6 @@ def git_ls_files(program_name: str, argc: i32, argv: &str) {
     }
 }
 
-enum ChangeType {
-    Modified
-    Deleted
-    Added
-}
-
-def ChangeType::str(this): str => match this {
-    Modified => "modified"
-    Deleted => "deleted"
-    Added => "added"
-}
-
-struct FileChange {
-    type: ChangeType
-    path: str
-}
-
-def FileChange::compare(this, other: FileChange): i8 => .path.compare(other.path)
-
-struct CurrentStatus {
-    head_commit_hash: StringHash
-    staged_changes: &Vector<FileChange>
-    unstaged_changes: &Vector<FileChange>
-    untracked_changes: &Vector<FileChange>
-}
-
-def CurrentStatus::free(&this) {
-    for change : .staged_changes.iter() { change.path.free() }
-    for change : .unstaged_changes.iter() { change.path.free() }
-    for change : .untracked_changes.iter() { change.path.free() }
-
-    .staged_changes.free()
-    .unstaged_changes.free()
-    .untracked_changes.free()
-}
-
-[extern] def realpath(path: str, resolved: &str): str
-let repo_base_path: SV
-
-def canonicalize_path(path: str): str {
-    let rp = realpath(path, null)
-    let sv = SV::from_str(rp)
-    if sv.starts_with_sv(repo_base_path) {
-        sv.chop_by_sv(repo_base_path)
-        if sv.starts_with_str("/") {
-            sv.chop_left()
-        }
-    }
-    return sv.data.copy()
-}
-
-def get_head_commit_hash(): StringHash {
-    let head_contents = fs::read_file(".git/HEAD")
-    defer head_contents.free()
-
-    let head_sv = head_contents.sv()
-    if not head_sv.starts_with_str("ref: ") {
-        panic(`[-] Unknown HEAD file contents: '{head_sv}'`)
-    }
-    head_sv.chop_by_delim(' ')
-
-    let ref_path = `.git/{head_sv}`
-    defer std::free(ref_path)
-
-    let ref_len = ref_path.len()
-    if ref_path[ref_len - 1] == '\n' then ref_path[ref_len - 1] = '\0'
-
-    let ref_contents = fs::read_file(ref_path)
-    let hash = StringHash::from_string(ref_contents.str())
-    defer ref_contents.free()
-
-    return hash
-}
-
-def collect_files_working_directory(dir_path: str, out: &Set<str>) {
-    for entry : fs::iterate_directory(dir_path) {
-        if entry.name.eq(".git") then continue
-
-        let new_path = match dir_path {
-            "." => entry.name.copy()
-            else => `{dir_path}/{entry.name}`
-        }
-        defer std::free(new_path)
-
-        match entry.type {
-            Directory => collect_files_working_directory(new_path, out)
-            File => out.add(canonicalize_path(new_path))
-            else => panic(`[-] Unknown file type: {entry.type}`)
-        }
-    }
-}
-
-def collect_files_from_tree(tree_hash: &StringHash, out: &Map<str, StringHash>, dir_path: str) {
-    let obj = get_object_from_hash_str(tree_hash)
-    defer obj.free()
-
-    if obj.type != ObjectType::Tree {
-        panic(`[-] Object {tree_hash.data} is not a tree`)
-    }
-
-    for entry : obj.u.tree.iter() {
-        if entry.name.eq(".git") then continue
-
-        let new_path = match dir_path {
-            "." => entry.name.copy()
-            else => `{dir_path}/{entry.name}`
-        }
-        defer std::free(new_path)
-
-        // FIXME: Change mode to `EntryType` enum
-        match entry.mode {
-            16384 => collect_files_from_tree(&entry.hash, out, new_path)
-            33188 | 33261 => {
-                let canon = new_path.copy()
-                out.insert(canon, entry.hash)
-            }
-            else => panic(`[-] Unknown mode: {entry.mode}`)
-        }
-    }
-}
-
-// Get the list of added/modified/deleted files that are not staged
-// (i.e. not in the index). We compare the index with the working
-// directory to get this information.
-def get_repository_status_unstaged(): CurrentStatus {
-    let index = get_index(".git/index")
-    defer index.free()
-
-    // Files from the working directory
-    let working_files_set = Set<str>::new()
-    defer working_files_set.free()
-    collect_files_working_directory(".", working_files_set)
-
-    // Files from the HEAD commit's tree
-    let tree_files_map = Map<str, StringHash>::new()
-    defer tree_files_map.free()
-    let commit_hash = get_head_commit_hash()
-    let commit_obj = get_object_from_hash_str(&commit_hash)
-    assert commit_obj.type == ObjectType::Commit, "HEAD is not a commit object"
-    let tree_hash = commit_obj.u.commit.tree
-    collect_files_from_tree(&tree_hash, tree_files_map, ".")
-
-    // Changes we want to collect
-    let staged_changes = Vector<FileChange>::new()
-    let unstaged_changes = Vector<FileChange>::new()
-    let untracked_changes = Vector<FileChange>::new()
-
-    for entry : index.entries.iter_values() {
-        let path = entry.path
-
-        if working_files_set.contains(path) {
-            let obj = create_blob_object_from_file(path)
-            defer obj.free()
-
-            let obj_hash = get_object_hash_only(&obj)
-            if not obj_hash.eq(&entry.hash) {
-                unstaged_changes.push(FileChange(Modified, path.copy()))
-            }
-
-        } else {
-            unstaged_changes.push(FileChange(Deleted, path.copy()))
-        }
-
-        let it = tree_files_map.get_item(path)
-        if it? {
-            if not it.value.eq(&entry.hash) {
-                staged_changes.push(FileChange(Modified, path.copy()))
-            }
-        } else {
-            staged_changes.push(FileChange(Added, path.copy()))
-        }
-    }
-
-    for path : working_files_set.iter() {
-        if not index.entries.contains(path) {
-            untracked_changes.push(FileChange(Added, path.copy()))
-        }
-        path.free()
-    }
-    for it : tree_files_map.iter() {
-        let path = it.key
-        if not index.entries.contains(path) {
-            staged_changes.push(FileChange(Deleted, path.copy()))
-        }
-        path.free()
-    }
-
-    sort<FileChange>(staged_changes.data, staged_changes.size)
-    sort<FileChange>(unstaged_changes.data, unstaged_changes.size)
-    sort<FileChange>(untracked_changes.data, untracked_changes.size)
-
-    return CurrentStatus(
-        head_commit_hash: commit_hash,
-        staged_changes: staged_changes,
-        unstaged_changes: unstaged_changes,
-        untracked_changes: untracked_changes
-    )
-}
-
 def git_status(program_name: str, argc: i32, argv: &str) {
     if argc > 0 then panic(`[-] Usage: {program_name} status`)
 
@@ -1029,23 +282,6 @@ def git_status(program_name: str, argc: i32, argv: &str) {
     }
 }
 
-def extract_pkt_lines(data: &Buffer): &Vector<SV> {
-    let lines = Vector<SV>::new()
-    let sv = data.sv()
-
-    while not sv.is_empty() {
-        let size_sv = sv.chop_left(4)
-        let sz_buf: [char; 5]
-        memcpy(sz_buf, size_sv.data, 4)
-
-        let size = std::libc::strtol(sz_buf, null, 16)
-        let usize = i32::max(size - 4, 0) as u32
-        lines.push(sv.chop_left(usize))
-    }
-
-    return lines
-}
-
 def git_clone(program_name: str, argc: i32, argv: &str) {
     if argc < 1 then panic(`[-] Usage: {program_name} clone <url> [directory]`)
     let url = shift_args(&argc, &argv)
@@ -1059,28 +295,32 @@ def git_clone(program_name: str, argc: i32, argv: &str) {
         panic(`[-] Please set GIT_USERNAME and GIT_PASSWORD environment variables`)
     }
 
-    let receive_pack_url = `{url}/info/refs?service=git-receive-pack`
+    let receive_pack_url = `{url}/info/refs?service=git-upload-pack`
     let resp = curl::http_request_auth(receive_pack_url, username, password, data: null)
-
-    // // For debugging - to avoid making the request every time
-    // fs::write_file("tmp_cache", resp)
-    // let resp = fs::read_file("tmp_cache")
 
     let lines = extract_pkt_lines(&resp)
     defer lines.free()
 
+    for line : lines.iter() {
+        println(`C: {line}`)
+    }
+
     if lines.size < 3 panic(`[-] Invalid response from server: {resp}`)
 
-    assert lines.at(0).eq_str("# service=git-receive-pack\n"), "Invalid service line"
+    assert lines.at(0).eq_str("# service=git-upload-pack"), "Invalid service line"
     assert lines.at(1).eq_str(""), "Invalid flush line"
 
     let master_hash: StringHash
     let found_master = false
 
+    fs::create_directory(".git")
+    fs::create_directory(".git/refs")
+    fs::create_directory(".git/refs/heads")
+    fs::create_directory(".git/refs/tags")
+
     for let i = 2; i < lines.size; i++ {
         let line = lines.at(i)
-        if line.eq_str("0000") then break
-        if line.len == 0 then continue
+        if line.len == 0 then break
 
         let first = line.chop_by_delim('\0')
         let hash = first.chop_by_delim(' ')
@@ -1097,8 +337,36 @@ def git_clone(program_name: str, argc: i32, argv: &str) {
         panic(`[-] No master branch found in the remote repository`)
     }
 
+    fs::write_file_str(".git/HEAD", "ref: refs/heads/master\n")
+    fs::write_file_str(".git/refs/heads/master", master_hash.data as str)
+
     println(`[+] Master hash: {master_hash.data}`)
+
+    let gen = PackLineGenerator::make()
+    gen.add_line_str(`want {master_hash.data:s}\n`)
+    gen.add_line_str(``)
+    gen.add_line_str(`done\n`)
+
+    let url2 = `{url}/git-upload-pack`
+    println(`[+] Requesting objects from: {url2}`)
+    let resp2 = curl::http_request_auth(url2, username, password, data: &gen.data)
+
+    unpack_all_objects(&resp2)
+
+    if not object_exists(&master_hash) {
+        panic(`[-] Can't find master commit {master_hash.data} in the received objects`)
+    }
+
+    let master_obj = get_object_from_hash_str(&master_hash)
+    assert master_obj.type == ObjectType::Commit, "HEAD is not a commit object"
+
+    let tree_hash = master_obj.u.commit.tree
+    master_obj.free()
+
+    println(`[+] Tree hash: {tree_hash.data}`)
+    restore_working_directory_from_tree(&tree_hash)
 }
+
 
 def main(argc: i32, argv: &str) {
     let program_name = shift_args(&argc, &argv)

@@ -1,0 +1,225 @@
+//* All the core data structures and methods for the git implementation
+
+import std::panic
+import std::hash::sha1::{ SHA1Hash }
+import std::sv::{ SV }
+import std::buffer::{ Buffer }
+import std::libc::{ memcpy, memcmp }
+import std::vector::{ Vector }
+import std::set::{ Set }
+import std::map::{ Map }
+import std::sort::{ sort }
+import std::traits::hash::{ hash_bytes }
+import std::time
+
+struct StringHash {
+    data: [char; 41]
+}
+
+def StringHash::eq(this, other: StringHash): bool {
+    return memcmp(this.data, other.data, 40) == 0
+}
+
+def StringHash::hash(this): u32 => hash_bytes(.data as &u8, 40)
+
+def StringHash::from_hash_bytes(hash_bytes: &SHA1Hash): StringHash {
+    let sh: StringHash
+    for let i = 0; i < 20; i++ {
+        let byte = hash_bytes.data[i]
+        sh.data[i * 2 + 0] = "0123456789abcdef"[byte >> 4]
+        sh.data[i * 2 + 1] = "0123456789abcdef"[byte & 0xf]
+    }
+    sh.data[40] = '\0'
+    return sh
+}
+
+def StringHash::to_hash_bytes(&this): SHA1Hash {
+    let hash_bytes: SHA1Hash
+    for let i = 0; i < 20; i++ {
+        let hi = .data[i * 2 + 0].get_hex_digit()
+        let lo = .data[i * 2 + 1].get_hex_digit()
+        hash_bytes.data[i] = (hi << 4) | lo
+    }
+    return hash_bytes
+}
+
+def StringHash::from_string(s: str): StringHash {
+    let sh: StringHash
+    memcpy(sh.data, s, 40)
+    sh.data[40] = '\0'
+    return sh
+}
+
+struct IndexEntry {
+    ctime_s, ctime_n: u32
+    mtime_s, mtime_n: u32
+    dev, ino: u32
+    modif: u32
+    uid, gid: u32
+    size: u32
+    hash: StringHash
+    flags: u16
+    path: str
+}
+
+def IndexEntry::compare(this, other: IndexEntry): i8 => .path.compare(other.path)
+def IndexEntry::free(&this) => std::free(.path)
+
+struct Index {
+    version: u32
+    entries: &Map<str, IndexEntry>
+}
+
+def Index::free(&this) {
+    for it : .entries.iter() {
+        it.value.free()
+    }
+    .entries.free()
+}
+
+def Index::sorted_entries(&this): &Vector<IndexEntry> {
+    let entries = Vector<IndexEntry>::new()
+    for it : .entries.iter() {
+        entries.push(it.value)
+    }
+    sort<IndexEntry>(entries.data, entries.size)
+    return entries
+}
+
+enum ObjectType {
+    Blob
+    Commit
+    Tree
+    Tag
+}
+
+def ObjectType::str(this): str => match this {
+    Blob => "blob"
+    Commit => "commit"
+    Tree => "tree"
+    Tag => "tag"
+}
+
+struct TreeEntry {
+    name: str
+    mode: u32
+    hash: StringHash
+}
+
+def TreeEntry::compare(this, other: TreeEntry): i8 => .name.compare(other.name)
+
+struct Commit {
+    tree: StringHash
+    parents: &Vector<StringHash>
+
+    author: str
+    author_time: u64
+    author_tz: str
+
+    committer: str
+    commit_time: u64
+    commit_tz: str
+
+    message: str
+}
+
+def Commit::free(&this) {
+    .parents.free()
+    .author.free()
+    .author_tz.free()
+    .committer.free()
+    .commit_tz.free()
+    .message.free()
+    std::free(this)
+}
+
+union ObjectData {
+    blob: Buffer
+    tree: &Vector<TreeEntry>
+    commit: &Commit
+}
+
+struct Object {
+    type: ObjectType
+    u: ObjectData
+}
+
+def Object::free(this) {
+    match .type {
+        Blob => .u.blob.free()
+        Tree => {
+            for entry : .u.tree.iter() {
+                entry.name.free()
+            }
+            .u.tree.free()
+        }
+        Commit => .u.commit.free()
+        else => panic(`[-] Unknown object type: {.type}`)
+    }
+}
+
+def Object::create_bytes(&this): Buffer {
+    let buf = Buffer::make()
+
+    match .type {
+        Blob => buf.putb(&.u.blob)
+        Tree => {
+            for entry : .u.tree.iter() {
+                buf.putsf(`{entry.mode} {entry.name}`)
+                buf.putc('\0')
+                let hash_bytes = entry.hash.to_hash_bytes()
+                buf.put_bytes(hash_bytes.data, 20)
+            }
+        }
+        Commit => {
+            let commit = .u.commit
+            buf.putsf(`tree {commit.tree.data}\n`)
+            for parent : commit.parents.iter() {
+                buf.putsf(`parent {parent.data}\n`)
+            }
+            buf.putsf(`author {commit.author} {commit.author_time} {commit.author_tz}\n`)
+            buf.putsf(`committer {commit.committer} {commit.commit_time} {commit.commit_tz}\n`)
+            buf.putc('\n')
+            buf.putsf(`{commit.message}\n`)
+        }
+        else => panic(`[-] Unknown object type: {.type}`)
+    }
+    return buf
+}
+
+
+enum ChangeType {
+    Modified
+    Deleted
+    Added
+}
+
+def ChangeType::str(this): str => match this {
+    Modified => "modified"
+    Deleted => "deleted"
+    Added => "added"
+}
+
+struct FileChange {
+    type: ChangeType
+    path: str
+}
+
+def FileChange::compare(this, other: FileChange): i8 => .path.compare(other.path)
+
+struct CurrentStatus {
+    head_commit_hash: StringHash
+    staged_changes: &Vector<FileChange>
+    unstaged_changes: &Vector<FileChange>
+    untracked_changes: &Vector<FileChange>
+}
+
+def CurrentStatus::free(&this) {
+    for change : .staged_changes.iter() { change.path.free() }
+    for change : .unstaged_changes.iter() { change.path.free() }
+    for change : .untracked_changes.iter() { change.path.free() }
+
+    .staged_changes.free()
+    .unstaged_changes.free()
+    .untracked_changes.free()
+}
