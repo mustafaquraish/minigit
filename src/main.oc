@@ -1,17 +1,8 @@
 import std::fs
 import std::panic
-// import std::hash::sha1::{ SHA1Hash }
 import std::sv::{ SV }
-// import std::zlib
-// import std::buffer::{ Buffer }
-// import std::bufferio::{ BufferIO }
 import std::libc::{ memcpy }
 import std::vector::{ Vector }
-// import std::set::{ Set }
-// import std::map::{ Map }
-// import std::sort::{ sort }
-// import std::traits::hash::{ hash_bytes }
-// import std::time
 
 import @curl
 import @core::{
@@ -301,10 +292,6 @@ def git_clone(program_name: str, argc: i32, argv: &str) {
     let lines = extract_pkt_lines(&resp)
     defer lines.free()
 
-    for line : lines.iter() {
-        println(`C: {line}`)
-    }
-
     if lines.size < 3 panic(`[-] Invalid response from server: {resp}`)
 
     assert lines.at(0).eq_str("# service=git-upload-pack"), "Invalid service line"
@@ -327,6 +314,12 @@ def git_clone(program_name: str, argc: i32, argv: &str) {
         let ref = first.chop_by_delim('\n')
 
         if ref.eq_str("refs/heads/master") {
+            memcpy(master_hash.data, hash.data, 40)
+            found_master = true
+            break
+        }
+
+        if ref.eq_str("refs/heads/main") {
             memcpy(master_hash.data, hash.data, 40)
             found_master = true
             break

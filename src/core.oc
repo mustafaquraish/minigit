@@ -162,25 +162,25 @@ def Object::create_bytes(&this): Buffer {
     let buf = Buffer::make()
 
     match .type {
-        Blob => buf.putb(&.u.blob)
+        Blob => buf += &.u.blob
         Tree => {
             for entry : .u.tree.iter() {
-                buf.putsf(`{entry.mode} {entry.name}`)
-                buf.putc('\0')
+                buf <<= `{entry.mode} {entry.name}`
+                buf += '\0'
                 let hash_bytes = entry.hash.to_hash_bytes()
-                buf.put_bytes(hash_bytes.data, 20)
+                buf.write_bytes(hash_bytes.data, 20)
             }
         }
         Commit => {
             let commit = .u.commit
-            buf.putsf(`tree {commit.tree.data}\n`)
+            buf <<= `tree {commit.tree.data}\n`
             for parent : commit.parents.iter() {
-                buf.putsf(`parent {parent.data}\n`)
+                buf <<= `parent {parent.data}\n`
             }
-            buf.putsf(`author {commit.author} {commit.author_time} {commit.author_tz}\n`)
-            buf.putsf(`committer {commit.committer} {commit.commit_time} {commit.commit_tz}\n`)
-            buf.putc('\n')
-            buf.putsf(`{commit.message}\n`)
+            buf <<= `author {commit.author} {commit.author_time} {commit.author_tz}\n`
+            buf <<= `committer {commit.committer} {commit.commit_time} {commit.commit_tz}\n`
+            buf += '\n'
+            buf <<= `{commit.message}\n`
         }
         else => panic(`[-] Unknown object type: {.type}`)
     }

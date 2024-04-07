@@ -7,8 +7,7 @@ import std::panic
 import std::hash::sha1::{ SHA1Hash }
 import std::sv::{ SV }
 import std::zlib
-import std::buffer::{ Buffer }
-import std::bufferio::{ BufferIO }
+import std::buffer::{ Buffer, BytesReader }
 import std::libc::{ memcpy }
 import std::vector::{ Vector }
 // import std::set::{ Set }
@@ -67,8 +66,8 @@ def PackLineGenerator::add_line_str(&this, line: str) {
     if size != 0 {
         size += 4
     }
-    .data.putsf(`{size:04x}`)
-    .data.puts(line)
+    .data <<= `{size:04x}`
+    .data += line
 }
 
 def PackLineGenerator::add_line_strf(&this, line: str) {
@@ -77,14 +76,14 @@ def PackLineGenerator::add_line_strf(&this, line: str) {
 }
 
 def PackLineGenerator::add_null_byte(&this) {
-    .data.putc('\0')
+    .data += '\0'
 }
 
 def PackLineGenerator::add_newline(&this) {
-    .data.putc('\n')
+    .data += '\n'
 }
 
-def read_size(io: &BufferIO): u32 {
+def read_size(io: &BytesReader): u32 {
     let size = 0
     let off = 0
 
@@ -98,7 +97,7 @@ def read_size(io: &BufferIO): u32 {
     return size
 }
 
-def parse_delta_offset_size(io: &BufferIO, flags: u8, start_bit: i8, end_bit: i8): u32 {
+def parse_delta_offset_size(io: &BytesReader, flags: u8, start_bit: i8, end_bit: i8): u32 {
     let num = 0
     let off = 0
     for let i = start_bit; i <= end_bit; i++ {
@@ -161,7 +160,7 @@ def Delta::free(&this) {
 
 
 def parse_delta(ref: &StringHash, data: Buffer): Delta {
-    let io = BufferIO::make(&data)
+    let io = data.reader()
     let base_size = read_size(&io)
     let result_size = read_size(&io)
 
@@ -206,8 +205,7 @@ def unpack_all_objects(data: &Buffer) {
     assert lines.at(0).eq_str("NAK"), "Server does not support smart protocol"
 
     let pack_line = lines.at(1)
-    let buf = Buffer::from_sv(pack_line)
-    let io = BufferIO::make(&buf)
+    let io = pack_line.reader()
 
     let header = io.read_bytes_sv(4)
     assert header.eq_str("PACK"), "Invalid pack header"
@@ -270,8 +268,8 @@ def unpack_all_objects(data: &Buffer) {
 
         let bytes_consumed: u32
         let decompressed = zlib::decompress_bytes(
-            buf.data + io.index,
-            buf.size - io.index,
+            pack_line.data as &u8 + io.index,
+            pack_line.len - io.index,
             &bytes_consumed
         )
         io.index += bytes_consumed
@@ -318,11 +316,11 @@ def unpack_all_objects(data: &Buffer) {
                 match inst.type {
                     Copy => {
                         // println(f"    copy: {inst.offset}, {inst.size}")
-                        body.put_bytes(base_data.data + inst.offset, inst.size)
+                        body.write_bytes(base_data.data + inst.offset, inst.size)
                     }
                     Insert => {
                         // println(f"    insert: {inst.data.len}")
-                        body.put_bytes(inst.data.data as &u8, inst.data.len)
+                        body.write_bytes(inst.data.data as &u8, inst.data.len)
                     }
                 }
             }

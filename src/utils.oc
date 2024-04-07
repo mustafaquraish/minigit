@@ -5,8 +5,7 @@ import std::panic
 import std::hash::sha1::{ SHA1Hash }
 import std::sv::{ SV }
 import std::zlib
-import std::buffer::{ Buffer }
-import std::bufferio::{ BufferIO }
+import std::buffer::{ Buffer, BytesReader }
 import std::libc::{ memcpy }
 import std::vector::{ Vector }
 import std::set::{ Set }
@@ -92,7 +91,7 @@ def get_index(path: str): Index {
     }
 
     let contents = fs::read_file(path)
-    let io = BufferIO::make(&contents)
+    let io = contents.reader()
 
     let header = io.read_u32()
     if header != 0x44495243 {  // "DIRC"
@@ -127,7 +126,7 @@ def get_index(path: str): Index {
         while true {
             let c = io.read_i8()
             if c == 0 then break
-            buf.putc(c as char)
+            buf += c as char
         }
         entry.path = buf.str()
 
@@ -143,39 +142,38 @@ def get_index(path: str): Index {
 def write_index(index: &Index, path: str = ".git/index") {
     let buf = Buffer::make()
     defer buf.free()
-    let io = BufferIO::make(&buf)
 
-    io.write_u32(0x44495243)  // "DIRC"
-    io.write_u32(index.version)
-    io.write_u32(index.entries.size)
+    buf.write_u32(0x44495243)  // "DIRC"
+    buf.write_u32(index.version)
+    buf.write_u32(index.entries.size)
 
     let entries = index.sorted_entries()
     defer entries.free()
 
     for entry : entries.iter() {
-        io.write_u32(entry.ctime_s)
-        io.write_u32(entry.ctime_n)
-        io.write_u32(entry.mtime_s)
-        io.write_u32(entry.mtime_n)
-        io.write_u32(entry.dev)
-        io.write_u32(entry.ino)
-        io.write_u32(entry.modif)
-        io.write_u32(entry.uid)
-        io.write_u32(entry.gid)
-        io.write_u32(entry.size)
+        buf.write_u32(entry.ctime_s)
+        buf.write_u32(entry.ctime_n)
+        buf.write_u32(entry.mtime_s)
+        buf.write_u32(entry.mtime_n)
+        buf.write_u32(entry.dev)
+        buf.write_u32(entry.ino)
+        buf.write_u32(entry.modif)
+        buf.write_u32(entry.uid)
+        buf.write_u32(entry.gid)
+        buf.write_u32(entry.size)
 
         let hash_bytes = entry.hash.to_hash_bytes()
-        io.write_bytes(hash_bytes.data, 20)
+        buf.write_bytes(hash_bytes.data, 20)
 
-        io.write_u16(entry.flags)
+        buf.write_u16(entry.flags)
 
         let path_len = entry.path.len()
-        io.write_bytes(entry.path, path_len)
-        io.write_u8(0)
+        buf.write_bytes(entry.path, path_len)
+        buf.write_u8(0)
 
         let padding = 7 - ((62 + path_len) % 8)
         for let i = 0; i < padding; i++ {
-            io.write_u8(0)
+            buf.write_u8(0)
         }
     }
 
@@ -235,13 +233,12 @@ def get_object(hash_str: &StringHash): Object {
     let size = sv.chop_u32()
     sv.chop_left() // skip null byte
 
-
     let obj: Object
 
     if kind.eq_str("blob") {
         obj.type = ObjectType::Blob
         obj.u.blob = Buffer::make()
-        obj.u.blob.putsv(sv)
+        obj.u.blob += sv
 
     } else if kind.eq_str("tree") {
         obj.type = ObjectType::Tree
@@ -343,9 +340,9 @@ def create_blob_object_from_file(filename: str): Object {
 
 def serialize_object_from_body(type: ObjectType, body: Buffer): Buffer {
     let obj_data = Buffer::make()
-    obj_data.putsf(`{type.str()} {body.size}`)
-    obj_data.putc('\0')
-    obj_data.putb(&body)
+    obj_data <<= `{type.str()} {body.size}`
+    obj_data += '\0'
+    obj_data += &body
     return obj_data
 }
 
