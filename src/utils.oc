@@ -2,6 +2,7 @@
 //* interacting with the state of the git repository.
 import std::fs
 import std::panic
+import std::mem
 import std::hash::sha1::{ SHA1Hash }
 import std::sv::{ SV }
 import std::zlib
@@ -27,10 +28,10 @@ import @core::{
 
 
 def copy_sv(sv: SV): str {
-    let mem = std::new<char>(sv.len + 1)
-    memcpy(mem, sv.data, sv.len)
-    mem[sv.len] = '\0'
-    return mem
+    let m = mem::alloc<char>(sv.len + 1)
+    memcpy(m, sv.data, sv.len)
+    m[sv.len] = '\0'
+    return m
 }
 
 [extern] def realpath(path: str, resolved: &str): str
@@ -57,7 +58,7 @@ def try_expand_hash(hash: str): StringHash {
     }
 
     let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
+    defer mem::free(dir_path)
 
     if not fs::directory_exists(dir_path) {
         panic(`[-] No objects found for hash: {hash}`)
@@ -191,7 +192,7 @@ def object_exists(hash_str: &StringHash): bool {
     let prefix = hash_sv.chop_left(2)
 
     let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
+    defer mem::free(dir_path)
 
     if not fs::directory_exists(dir_path) {
         return false
@@ -199,7 +200,7 @@ def object_exists(hash_str: &StringHash): bool {
 
     let file_path = `{dir_path}/{hash_sv}`
     let exists = fs::file_exists(file_path)
-    std::free(file_path)
+    mem::free(file_path)
 
     return exists
 }
@@ -209,14 +210,14 @@ def get_object(hash_str: &StringHash): Object {
     let prefix = hash_sv.chop_left(2)
 
     let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
+    defer mem::free(dir_path)
 
     if not fs::directory_exists(dir_path) {
         panic(`[-] Object {hash_str.data:s} not found (missing directory {dir_path})`)
     }
 
     let file_path = `{dir_path}/{hash_sv}`
-    defer std::free(file_path)
+    defer mem::free(file_path)
 
     if not fs::file_exists(file_path) {
         panic(`[-] Object {hash_str.data:s} not found (missing file {file_path})`)
@@ -264,7 +265,7 @@ def get_object(hash_str: &StringHash): Object {
     } else if kind.eq_str("commit") {
         obj.type = ObjectType::Commit
 
-        let commit = std::new<Commit>()
+        let commit = mem::alloc<Commit>()
         commit.parents = Vector<StringHash>::new()
         while not sv.is_empty() {
             let line = sv.chop_line()
@@ -369,12 +370,12 @@ def write_object_from_body(type: ObjectType, body: Buffer): StringHash {
     let prefix = hash_sv.chop_left(2)
 
     let dir_path = `.git/objects/{prefix}`
-    defer std::free(dir_path)
+    defer mem::free(dir_path)
 
     fs::create_directory(dir_path, exists_ok: true)
 
     let file_path = `{dir_path}/{hash_sv}`
-    defer std::free(file_path)
+    defer mem::free(file_path)
 
     let compressed = zlib::compress(data)
     defer compressed.free()
@@ -400,7 +401,7 @@ def create_tree_object_from_dir(dir_path: str, dry_run: bool = true): Object {
         if entry.name.eq(".git") then continue
 
         let new_path = `{dir_path}/{entry.name}`
-        defer std::free(new_path)
+        defer mem::free(new_path)
 
         let obj = match entry.type {
             Directory => create_tree_object_from_dir(new_path)
@@ -448,7 +449,7 @@ def create_commit_object(tree_hash: &StringHash, parent_hashes: &Vector<StringHa
     let obj: Object
     obj.type = ObjectType::Commit
 
-    obj.u.commit = std::new<Commit>()
+    obj.u.commit = mem::alloc<Commit>()
     *obj.u.commit = Commit(
         tree: *tree_hash,
         parents: parent_hashes_copy,
@@ -504,7 +505,7 @@ def get_head_commit_hash(): StringHash {
     head_sv.chop_by_delim(' ')
 
     let ref_path = `.git/{head_sv}`
-    defer std::free(ref_path)
+    defer mem::free(ref_path)
 
     let ref_len = ref_path.len()
     if ref_path[ref_len - 1] == '\n' then ref_path[ref_len - 1] = '\0'
@@ -524,7 +525,7 @@ def collect_files_working_directory(dir_path: str, out: &Set<str>) {
             "." => entry.name.copy()
             else => `{dir_path}/{entry.name}`
         }
-        defer std::free(new_path)
+        defer mem::free(new_path)
 
         match entry.type {
             Directory => collect_files_working_directory(new_path, out)
@@ -549,7 +550,7 @@ def collect_files_from_tree(tree_hash: &StringHash, out: &Map<str, StringHash>, 
             "." => entry.name.copy()
             else => `{dir_path}/{entry.name}`
         }
-        defer std::free(new_path)
+        defer mem::free(new_path)
 
         // FIXME: Change mode to `EntryType` enum
         match entry.mode {
